@@ -37,11 +37,27 @@ Skróty klawiszowe:
 | `Tab`               | przełącz aktywnego agenta    |
 | `Enter`             | wyślij wiadomość do agenta   |
 | `@all ...`          | wyślij do wszystkich agentów |
+| `Ctrl+]`            | tryb passthrough (wł./wył.)  |
 | `?`                 | pomoc                        |
 | `Ctrl+R`            | restart aktywnego agenta     |
 | `Ctrl+C` / `Ctrl+Q` | wyjście                      |
 
 Stan sesji trafia do `.parley/` w katalogu projektu.
+
+### ⚠️ Gdy agent pyta o interakcję (tryb passthrough)
+
+Czasem agent wymaga bezpośredniej odpowiedzi — potwierdzenia akcji (`y/n`),
+wyboru z listy (strzałki), logowania itp. W normalnym trybie to, co piszesz,
+trafia do **linii wejścia parley**, a nie do agenta. Żeby odpowiedzieć
+**bezpośrednio agentowi**:
+
+1. Naciśnij **`Ctrl+]`** — wejdziesz w tryb **passthrough**.
+2. Twoje klawisze (`y`/`n`, strzałki, `Enter`, itp.) lecą teraz wprost do
+   aktywnego agenta — zatwierdź / wybierz to, o co pyta.
+3. Naciśnij ponownie **`Ctrl+]`**, żeby wrócić do normalnego trybu parley.
+
+> Passthrough działa tylko dla **aktywnego, żyjącego** agenta (`Tab` przełącza
+> aktywnego).
 
 ## ⚙️ Konfiguracja
 
