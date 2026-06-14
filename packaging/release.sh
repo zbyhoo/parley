@@ -69,7 +69,7 @@ URL="https://github.com/${TAP_REPO}/releases/download/${TAG}/${TARBALL_NAME}"
 TAP_DIR="target/tap"
 if [ ! -d "$TAP_DIR/.git" ]; then
   rm -rf "$TAP_DIR"
-  gh repo clone "$TAP_REPO" "$TAP_DIR"
+  git clone "git@github.com:${TAP_REPO}.git" "$TAP_DIR"
 else
   git -C "$TAP_DIR" pull --ff-only
 fi
