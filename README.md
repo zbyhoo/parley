@@ -59,6 +59,53 @@ trafia do **linii wejścia parley**, a nie do agenta. Żeby odpowiedzieć
 > Passthrough działa tylko dla **aktywnego, żyjącego** agenta (`Tab` przełącza
 > aktywnego).
 
+## 🤖 Headless mode
+
+Run an agent in a transparent passthrough wrapper connected to a shared broker:
+
+```bash
+parley claude                    # wrap claude (auto peer id: "claude")
+parley codex resume              # wrap codex with extra args
+parley --as reviewer claude      # assign custom peer id "reviewer"
+```
+
+The wrapper passes all input/output natively — scroll, mouse, and resize all
+work. The agent renders directly to your terminal; parley adds no re-rendering.
+
+### Peer ids
+
+Auto ids are derived from the binary name: `claude`, `claude-2`, `codex`, …
+Use `--as <id>` to assign a custom id. If the id is already in use by another
+running wrapper, the new wrapper exits immediately with an error.
+
+### Agent-to-agent communication
+
+All agents in the same directory join one broker. They communicate via two MCP
+tools injected by the wrapper:
+
+| Tool | Description |
+| ---- | ----------- |
+| `list_peers` | List all currently connected peer ids |
+| `send_to_peer(to, msg)` | Send a message to a specific peer, or `to="all"` for broadcast |
+
+Delivery is automatic — no moderation queue. All traffic is logged to
+`.parley/session-*/timeline.jsonl`.
+
+### Broker commands
+
+```bash
+parley stop   # stop the broker daemon; removes broker.json
+parley mcp    # write/merge a project .mcp.json so a bare `claude`
+              # (launched outside parley) can still send messages
+              # (best-effort: receiving still requires the wrapper;
+              #  re-run after a broker restart)
+```
+
+### `parley` with no arguments
+
+Running `parley` with no arguments still launches the existing TUI (see
+[Użycie](#️-użycie) above).
+
 ## ⚙️ Konfiguracja
 
 Opcjonalny plik konfiguracyjny pozwala nadpisać komendy agentów
