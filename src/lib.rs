@@ -1,6 +1,7 @@
 pub mod app;
 pub mod broker;
 pub mod config;
+pub mod headless;
 pub mod history;
 pub mod hygiene;
 pub mod keys;
