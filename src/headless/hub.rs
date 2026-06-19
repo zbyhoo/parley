@@ -300,7 +300,7 @@ pub fn serve(cwd: PathBuf) -> anyhow::Result<()> {
     let state = Arc::new(HubState {
         reg: Mutex::new(Registry::new()),
         token: token.clone(),
-        cwd: cwd.to_string_lossy().into_owned(),
+        cwd: crate::headless::discovery::canonical_cwd(&cwd),
         timeline: Mutex::new(timeline),
         pollers: Mutex::new(HashSet::new()),
         receivers: Mutex::new(HashMap::new()),

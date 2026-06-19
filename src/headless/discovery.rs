@@ -53,10 +53,17 @@ pub fn random_token() -> String {
 
 use std::time::{Duration, Instant};
 
-fn health_ok(info: &BrokerInfo, cwd: &Path) -> bool {
-    let want = std::fs::canonicalize(cwd)
+/// Canonical string form of a working directory, used on BOTH the broker side
+/// (stored in HubState/health) and the wrapper side (health_ok comparison), so
+/// the handshake matches even when the path contains symlinks (e.g. macOS /var).
+pub fn canonical_cwd(path: &std::path::Path) -> String {
+    std::fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| cwd.to_string_lossy().into_owned());
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+}
+
+fn health_ok(info: &BrokerInfo, cwd: &Path) -> bool {
+    let want = canonical_cwd(cwd);
     let url = format!("http://127.0.0.1:{}/health?token={}", info.port, info.token);
     match reqwest::blocking::Client::new()
         .get(&url)
@@ -77,9 +84,10 @@ fn spawn_daemon(self_exe: &Path, cwd: &Path, state_dir: &Path) -> std::io::Resul
         .append(true)
         .open(state_dir.join("broker.log"))?;
     let log_err = log.try_clone()?;
+    let canonical = canonical_cwd(cwd);
     let mut cmd = Command::new(self_exe);
     cmd.arg("__serve")
-        .current_dir(cwd)
+        .current_dir(&canonical)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(log_err));
@@ -191,5 +199,13 @@ mod tests {
         assert_eq!(t.len(), 32);
         assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(t, random_token());
+    }
+
+    #[test]
+    fn canonical_cwd_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let once = canonical_cwd(dir.path());
+        let twice = canonical_cwd(std::path::Path::new(&once));
+        assert_eq!(once, twice);
     }
 }
