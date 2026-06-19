@@ -74,7 +74,7 @@ work. The agent renders directly to your terminal; parley adds no re-rendering.
 
 ### Peer ids
 
-Auto ids are derived from the binary name: `claude`, `claude-2`, `codex`, …
+Auto ids are derived from the command name (first word of `<cmd...>` passed to parley): `claude`, `claude-2`, `codex`, …
 Use `--as <id>` to assign a custom id. If the id is already in use by another
 running wrapper, the new wrapper exits immediately with an error.
 
@@ -86,7 +86,7 @@ tools injected by the wrapper:
 | Tool | Description |
 | ---- | ----------- |
 | `list_peers` | List all currently connected peer ids |
-| `send_to_peer(to, msg)` | Send a message to a specific peer, or `to="all"` for broadcast |
+| `send_to_peer(to, message)` | Send a message to a specific peer, or `to="all"` for broadcast |
 
 Delivery is automatic — no moderation queue. All traffic is logged to
 `.parley/session-*/timeline.jsonl`.
