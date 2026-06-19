@@ -39,9 +39,13 @@ impl Registry {
 
     fn alloc_id(&mut self, binary: &str) -> String {
         let n = self.next_idx.entry(binary.to_string()).or_insert(1);
-        let id = if *n == 1 { binary.to_string() } else { format!("{binary}-{n}") };
-        *n += 1;
-        id
+        loop {
+            let id = if *n == 1 { binary.to_string() } else { format!("{binary}-{n}") };
+            *n += 1;
+            if !self.peers.contains_key(&id) {
+                return id;
+            }
+        }
     }
 
     pub fn register(
@@ -207,5 +211,14 @@ mod tests {
         let mut r = Registry::new();
         let (_id, _rx) = r.register("claude", None).unwrap();
         assert_eq!(r.register_mcp_only("claude"), Err(RegisterError::Collision("claude".into())));
+    }
+
+    #[test]
+    fn auto_id_skips_manually_taken_name() {
+        let mut r = Registry::new();
+        let (_id, _rx) = r.register("x", Some("codex")).unwrap(); // manual peer named "codex"
+        let (auto, _rx2) = r.register("codex", None).unwrap();      // auto for binary "codex"
+        assert_ne!(auto, "codex", "auto id must not overwrite the live manual peer");
+        assert!(r.is_live("codex"));
     }
 }
