@@ -1,11 +1,142 @@
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::{AgentConfig, Config};
+use crate::history::History;
 use crate::pty::AgentProcess;
 use crate::router::{self, AgentId, Parsed, Target};
 use crate::timeline::{now_ts, Entry, Kind, Timeline};
+
+/// Pozycja podpowiedzi autocomplete: wartość do wstawienia + krótki opis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompletionItem {
+    pub value: &'static str,
+    pub desc: &'static str,
+}
+
+/// Stan autocomplete dla bieżącego inputu: pasujący kandydaci + wpisany prefiks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    pub candidates: Vec<CompletionItem>,
+    pub prefix: String,
+}
+
+const TARGETS: &[CompletionItem] = &[
+    CompletionItem { value: "@claude", desc: "send to claude" },
+    CompletionItem { value: "@codex", desc: "send to codex" },
+    CompletionItem { value: "@all", desc: "send to both agents" },
+];
+
+const COMMANDS: &[CompletionItem] = &[
+    CompletionItem { value: "/auto", desc: "auto-approve N peer messages" },
+    CompletionItem { value: "/discuss", desc: "start a peer discussion" },
+    CompletionItem { value: "/help", desc: "show help" },
+];
+
+/// Maksymalna liczba linii wyniku bash dopisywana do timeline (reszta ucinana).
+const MAX_BASH_LINES: usize = 50;
+/// Limit czasu wykonania komendy bash — po nim proces jest ubijany.
+const BASH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// True gdy input to komenda bash (prefiks '!'), jak w Claude Code / Codex.
+pub fn is_bash_input(input: &str) -> bool {
+    input.starts_with('!')
+}
+
+/// Wynik wykonania komendy bash: linie wyjścia (stdout+stderr) + linia statusu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BashOutput {
+    pub lines: Vec<String>,
+    pub status: String,
+}
+
+/// Uruchamia komendę przez `sh -c` w `cwd`, synchronicznie, z limitem czasu.
+/// Po przekroczeniu `timeout` proces jest ubijany. stdout i stderr czytane są
+/// w osobnych wątkach, żeby pełny bufor potoku nie zakleszczył wykonania.
+pub fn run_bash_command(cmd: &str, cwd: &Path, timeout: Duration) -> std::io::Result<BashOutput> {
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut so = child.stdout.take().expect("stdout piped");
+    let mut se = child.stderr.take().expect("stderr piped");
+    let h_out = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = so.read_to_string(&mut s);
+        s
+    });
+    let h_err = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = se.read_to_string(&mut s);
+        s
+    });
+
+    let start = Instant::now();
+    let mut timed_out = false;
+    let exit = loop {
+        if let Some(st) = child.try_wait()? {
+            break Some(st);
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            timed_out = true;
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    // Po zakończeniu/zabiciu procesu potoki się zamykają → wątki czytające kończą się.
+    let stdout = h_out.join().unwrap_or_default();
+    let stderr = h_err.join().unwrap_or_default();
+    let mut lines: Vec<String> =
+        stdout.lines().chain(stderr.lines()).map(str::to_string).collect();
+    let truncated = lines.len() > MAX_BASH_LINES;
+    if truncated {
+        lines.truncate(MAX_BASH_LINES);
+    }
+
+    let mut status = if timed_out {
+        format!("[bash] timed out after {}s — killed", timeout.as_secs())
+    } else {
+        match exit.and_then(|s| s.code()) {
+            Some(c) => format!("[bash] exit {c}"),
+            None => "[bash] terminated by signal".to_string(),
+        }
+    };
+    if truncated {
+        status.push_str(&format!(" (output truncated to {MAX_BASH_LINES} lines)"));
+    }
+    Ok(BashOutput { lines, status })
+}
+
+/// Podpowiedzi dla wiodącego tokenu komendy. Aktywne TYLKO gdy input zaczyna się
+/// od '@' lub '/' i nie zawiera białego znaku (uzupełniamy sam token, nie argumenty).
+/// Zwraca None gdy brak dopasowań (np. "@obaj").
+pub fn completion_state(input: &str) -> Option<Completion> {
+    let first = input.chars().next()?;
+    if first != '@' && first != '/' {
+        return None;
+    }
+    if input.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let pool: &[CompletionItem] = if first == '@' { TARGETS } else { COMMANDS };
+    let candidates: Vec<CompletionItem> =
+        pool.iter().copied().filter(|c| c.value.starts_with(input)).collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    Some(Completion { candidates, prefix: input.to_string() })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -47,6 +178,16 @@ pub struct App {
     pub auto: Option<u32>,
     /// Górny limit dla `/auto N` (z configu).
     pub auto_max: u32,
+    /// Podświetlony kandydat autocomplete (indeks w candidates).
+    pub completion_index: usize,
+    /// True po Esc — chowa podpowiedź aż do następnej edycji inputu.
+    pub completion_dismissed: bool,
+    /// Trwała historia wysłanych promptów.
+    pub history: History,
+    /// Pozycja przeglądania historii: None = edycja bieżącego szkicu.
+    pub history_index: Option<usize>,
+    /// Szkic zachowany przy pierwszym ↑, przywracany po zejściu poniżej najnowszego.
+    pub history_draft: String,
 }
 
 /// Komenda restartu: resume tylko gdy w tej sesji coś wysłano —
@@ -101,6 +242,7 @@ impl App {
     pub fn new(
         config: Config,
         timeline: Timeline,
+        history: History,
         cwd: PathBuf,
         pending: crate::pending::PendingQueue,
     ) -> Self {
@@ -136,7 +278,94 @@ impl App {
             pending,
             auto: None,
             auto_max,
+            completion_index: 0,
+            completion_dismissed: false,
+            history,
+            history_index: None,
+            history_draft: String::new(),
         }
+    }
+
+    /// Aktywne podpowiedzi dla bieżącego inputu (None gdy schowane przez Esc).
+    pub fn active_completion(&self) -> Option<Completion> {
+        if self.completion_dismissed {
+            return None;
+        }
+        completion_state(&self.input)
+    }
+
+    /// Reset stanu autocomplete po każdej edycji treści (zmiana kandydatów).
+    /// Nie rusza nawigacji historią — zachowanie shell-owe (edycja przywołanego wpisu).
+    fn on_input_edited(&mut self) {
+        self.completion_index = 0;
+        self.completion_dismissed = false;
+    }
+
+    fn insert_char(&mut self, c: char) {
+        self.input.push(c);
+        self.on_input_edited();
+    }
+
+    fn insert_newline(&mut self) {
+        self.input.push('\n');
+        self.on_input_edited();
+    }
+
+    fn input_backspace(&mut self) {
+        self.input.pop();
+        self.on_input_edited();
+    }
+
+    /// Tab przy aktywnym autocomplete: wstaw wybranego kandydata + spację.
+    fn accept_completion(&mut self) {
+        let Some(comp) = self.active_completion() else { return };
+        let idx = self.completion_index.min(comp.candidates.len() - 1);
+        self.input = format!("{} ", comp.candidates[idx].value);
+        self.on_input_edited();
+    }
+
+    /// ↑/↓ przy aktywnym autocomplete: przesuń podświetlenie (z zawinięciem).
+    fn completion_move(&mut self, forward: bool) {
+        let Some(comp) = self.active_completion() else { return };
+        let n = comp.candidates.len();
+        let i = self.completion_index % n;
+        self.completion_index = if forward { (i + 1) % n } else { (i + n - 1) % n };
+    }
+
+    /// ↑: starszy prompt z historii (przy pierwszym — stash bieżącego szkicu).
+    fn history_up(&mut self) {
+        let n = self.history.entries.len();
+        if n == 0 {
+            return;
+        }
+        match self.history_index {
+            None => {
+                self.history_draft = std::mem::take(&mut self.input);
+                self.history_index = Some(n - 1);
+            }
+            Some(i) if i > 0 => self.history_index = Some(i - 1),
+            Some(_) => return, // najstarszy
+        }
+        let i = self.history_index.unwrap();
+        self.input = self.history.entries[i].clone();
+        self.on_input_edited();
+    }
+
+    /// ↓: nowszy prompt; poniżej najnowszego — przywróć zachowany szkic.
+    fn history_down(&mut self) {
+        let n = self.history.entries.len();
+        match self.history_index {
+            None => return,
+            Some(i) if i + 1 < n => {
+                self.history_index = Some(i + 1);
+                self.input = self.history.entries[i + 1].clone();
+            }
+            Some(_) => {
+                self.history_index = None;
+                self.input = std::mem::take(&mut self.history_draft);
+            }
+        }
+        self.on_input_edited();
     }
 
     pub fn pane(&self, id: AgentId) -> &AgentPane {
@@ -189,33 +418,46 @@ impl App {
                     }
                     return;
                 }
-                match (key.code, ctrl) {
-                (KeyCode::Char('c'), true) | (KeyCode::Char('q'), true) => self.confirm_quit = true,
-                (KeyCode::Char('r'), true) => self.restart_focused(),
-                (KeyCode::Tab, _) => self.focus = self.focus.other(),
-                (KeyCode::Enter, _) => self.submit_input(),
-                (KeyCode::Esc, _) => {
-                    if self.auto.is_some() {
-                        self.auto = None;
-                        let _ = self.timeline.append(Entry {
-                            ts: now_ts(),
-                            from: "parley".into(),
-                            to: "user".into(),
-                            kind: Kind::Event,
-                            text: "auto mode aborted".into(),
-                        });
-                    } else {
-                        self.input.clear();
+                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                let comp_active = self.active_completion().is_some();
+                match key.code {
+                    KeyCode::Char('c') if ctrl => self.confirm_quit = true,
+                    KeyCode::Char('q') if ctrl => self.confirm_quit = true,
+                    KeyCode::Char('r') if ctrl => self.restart_focused(),
+                    // Ctrl+J: uniwersalna twarda nowa linia (działa też bez protokołu kitty).
+                    KeyCode::Char('j') if ctrl => self.insert_newline(),
+                    // Shift+Enter wstawia nową linię; goły Enter wysyła.
+                    KeyCode::Enter if shift => self.insert_newline(),
+                    KeyCode::Enter => self.submit_input(),
+                    KeyCode::Tab if comp_active => self.accept_completion(),
+                    KeyCode::Tab => self.focus = self.focus.other(),
+                    KeyCode::Up if comp_active => self.completion_move(false),
+                    KeyCode::Up => self.history_up(),
+                    KeyCode::Down if comp_active => self.completion_move(true),
+                    KeyCode::Down => self.history_down(),
+                    KeyCode::Esc if comp_active => self.completion_dismissed = true,
+                    KeyCode::Esc => {
+                        if self.auto.is_some() {
+                            self.auto = None;
+                            let _ = self.timeline.append(Entry {
+                                ts: now_ts(),
+                                from: "parley".into(),
+                                to: "user".into(),
+                                kind: Kind::Event,
+                                text: "auto mode aborted".into(),
+                            });
+                        } else {
+                            self.input.clear();
+                            self.on_input_edited();
+                        }
                     }
+                    KeyCode::Backspace => self.input_backspace(),
+                    // '?' przy pustym wejściu otwiera pomoc; w trakcie pisania to zwykły znak.
+                    KeyCode::Char('?') if !ctrl && self.input.is_empty() => self.show_help = true,
+                    KeyCode::Char(c) if !ctrl => self.insert_char(c),
+                    _ => {}
                 }
-                (KeyCode::Backspace, _) => {
-                    self.input.pop();
-                }
-                // '?' przy pustym wejściu otwiera pomoc; w trakcie pisania to zwykły znak.
-                (KeyCode::Char('?'), false) if self.input.is_empty() => self.show_help = true,
-                (KeyCode::Char(c), false) => self.input.push(c),
-                _ => {}
-            }},
+            },
             Mode::Passthrough => {
                 if is_passthrough_toggle(&key) {
                     self.mode = Mode::Input;
@@ -240,7 +482,16 @@ impl App {
     /// Enter w input mode: routing + doręczenie + wpis do timeline.
     fn submit_input(&mut self) {
         let line = std::mem::take(&mut self.input);
+        // Reset nawigacji historią/podpowiedziami niezależnie od treści.
+        self.history_index = None;
+        self.history_draft.clear();
+        self.on_input_edited();
         if line.trim().is_empty() {
+            return;
+        }
+        let _ = self.history.push(line.clone());
+        if let Some(cmd) = line.strip_prefix('!') {
+            self.run_bash(cmd);
             return;
         }
         if matches!(line.trim(), "/help" | "/?") {
@@ -292,6 +543,40 @@ impl App {
                     });
                 }
             }
+        }
+    }
+
+    /// Wykonuje komendę bash (prefiks '!'); echo komendy i wynik trafiają do timeline.
+    fn run_bash(&mut self, cmd: &str) {
+        let cmd = cmd.trim();
+        if cmd.is_empty() {
+            return;
+        }
+        let log = |app: &mut App, from: &str, kind: Kind, text: String| {
+            let _ = app.timeline.append(Entry {
+                ts: now_ts(),
+                from: from.into(),
+                to: "user".into(),
+                kind,
+                text,
+            });
+        };
+        // Echo komendy (jako wiadomość user→bash).
+        let _ = self.timeline.append(Entry {
+            ts: now_ts(),
+            from: "user".into(),
+            to: "bash".into(),
+            kind: Kind::Message,
+            text: format!("! {cmd}"),
+        });
+        match run_bash_command(cmd, &self.cwd, BASH_TIMEOUT) {
+            Ok(out) => {
+                for line in out.lines {
+                    log(self, "bash", Kind::Event, line);
+                }
+                log(self, "bash", Kind::Event, out.status);
+            }
+            Err(e) => log(self, "bash", Kind::Event, format!("[bash] failed to run: {e}")),
         }
     }
 
@@ -589,10 +874,11 @@ mod tests {
     fn test_app() -> App {
         let dir = tempfile::tempdir().unwrap();
         let tl = Timeline::open(&dir.path().join("timeline.jsonl")).unwrap();
+        let hist = History::open(&dir.path().join("history.jsonl")).unwrap();
         let cwd = dir.path().to_path_buf();
         // tempdir musi przeżyć App w testach — leak jest tu akceptowalny
         std::mem::forget(dir);
-        App::new(Config::default(), tl, cwd, crate::pending::new_queue())
+        App::new(Config::default(), tl, hist, cwd, crate::pending::new_queue())
     }
 
     fn test_app_with_live_agent() -> App {
@@ -1007,6 +1293,165 @@ mod tests {
     }
 
     #[test]
+    fn completion_state_matches_targets_and_commands() {
+        let vals = |s: &str| {
+            completion_state(s)
+                .map(|c| c.candidates.iter().map(|i| i.value).collect::<Vec<_>>())
+        };
+        assert_eq!(vals("@cod"), Some(vec!["@codex"]));
+        assert_eq!(vals("@c"), Some(vec!["@claude", "@codex"]));
+        assert_eq!(vals("@"), Some(vec!["@claude", "@codex", "@all"]));
+        assert_eq!(vals("/"), Some(vec!["/auto", "/discuss", "/help"]));
+        assert_eq!(vals("/d"), Some(vec!["/discuss"]));
+        assert_eq!(vals("@obaj"), None); // brak dopasowań
+        assert_eq!(vals("@codex hej"), None); // po spacji nieaktywne
+        assert_eq!(vals("hej"), None); // nie zaczyna się od @ ani /
+        assert_eq!(vals(""), None);
+    }
+
+    #[test]
+    fn tab_accepts_completion_then_inserts_space() {
+        let mut app = test_app();
+        for c in "@cod".chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input, "@codex ");
+        // po spacji autocomplete nieaktywne → Tab przełącza focus
+        assert!(app.active_completion().is_none());
+        let before = app.focus;
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focus, before.other());
+    }
+
+    #[test]
+    fn arrows_navigate_completion_candidates() {
+        let mut app = test_app();
+        for c in "@c".chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.completion_index, 0); // @claude
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.completion_index, 1); // @codex
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.completion_index, 0); // zawinięcie (2 kandydatów)
+        app.handle_key(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.completion_index, 1);
+        // akceptacja wybranego (codex)
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input, "@codex ");
+    }
+
+    #[test]
+    fn esc_dismisses_completion_without_clearing_input() {
+        let mut app = test_app();
+        for c in "@cod".chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.input, "@cod"); // input nietknięty
+        assert!(app.active_completion().is_none()); // schowane
+        // kolejna edycja przywraca podpowiedź
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(app.active_completion().is_some());
+    }
+
+    #[test]
+    fn shift_enter_and_ctrl_j_insert_newline() {
+        let mut app = test_app();
+        app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE));
+        app.handle_key(key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(app.input, "a\nb\nc");
+        // goły Enter wysyła (input czyszczony), nie wstawia nowej linii
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn history_up_down_navigates_and_restores_draft() {
+        let mut app = test_app();
+        type_line(&mut app, "first");
+        type_line(&mut app, "second");
+        // wpisz szkic (nie wysyłaj)
+        for c in "draft".chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input, "second");
+        app.handle_key(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input, "first");
+        app.handle_key(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input, "first"); // najstarszy — bez zmian
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.input, "second");
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.input, "draft"); // przywrócony szkic
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.input, "draft"); // poniżej szkicu — bez zmian
+    }
+
+    #[test]
+    fn submitted_prompt_lands_in_history() {
+        let mut app = test_app();
+        type_line(&mut app, "@claude hello");
+        assert_eq!(app.history.entries, vec!["@claude hello".to_string()]);
+        assert_eq!(app.history_index, None);
+    }
+
+    #[test]
+    fn bash_command_echo_captures_output_and_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_bash_command("echo hello", dir.path(), Duration::from_secs(5)).unwrap();
+        assert_eq!(out.lines, vec!["hello".to_string()]);
+        assert_eq!(out.status, "[bash] exit 0");
+    }
+
+    #[test]
+    fn bash_command_nonzero_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_bash_command("exit 3", dir.path(), Duration::from_secs(5)).unwrap();
+        assert!(out.lines.is_empty());
+        assert_eq!(out.status, "[bash] exit 3");
+    }
+
+    #[test]
+    fn bash_command_runs_in_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("marker.txt"), "x").unwrap();
+        let out = run_bash_command("ls", dir.path(), Duration::from_secs(5)).unwrap();
+        assert!(out.lines.iter().any(|l| l.contains("marker.txt")));
+    }
+
+    #[test]
+    fn bash_command_timeout_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_bash_command("sleep 5", dir.path(), Duration::from_millis(100)).unwrap();
+        assert!(out.status.contains("timed out"), "status: {}", out.status);
+    }
+
+    #[test]
+    fn bang_prefix_runs_bash_and_logs_to_timeline() {
+        let mut app = test_app();
+        type_line(&mut app, "!echo hi");
+        let texts: Vec<String> = app.timeline.entries.iter().map(|e| e.text.clone()).collect();
+        assert!(texts.iter().any(|t| t == "! echo hi"), "echo wpis: {texts:?}");
+        assert!(texts.iter().any(|t| t == "hi"), "wyjście: {texts:?}");
+        assert!(texts.iter().any(|t| t == "[bash] exit 0"), "status: {texts:?}");
+        // komenda trafia też do historii (re-run przez ↑)
+        assert_eq!(app.history.entries.last().unwrap(), "!echo hi");
+    }
+
+    #[test]
+    fn is_bash_input_detects_bang_prefix() {
+        assert!(is_bash_input("!ls"));
+        assert!(!is_bash_input("@claude hi"));
+        assert!(!is_bash_input("ls"));
+    }
+
+    #[test]
     fn help_commands_open_help() {
         for cmd in ["/help", "/?"] {
             let mut app = test_app();
@@ -1031,9 +1476,10 @@ mod tests {
     fn passthrough_exits_when_focused_agent_dies() {
         let dir = tempfile::tempdir().unwrap();
         let tl = Timeline::open(&dir.path().join("timeline.jsonl")).unwrap();
+        let hist = History::open(&dir.path().join("history.jsonl")).unwrap();
         let cwd = dir.path().to_path_buf();
         std::mem::forget(dir);
-        let mut app = App::new(Config::default(), tl, cwd, crate::pending::new_queue());
+        let mut app = App::new(Config::default(), tl, hist, cwd, crate::pending::new_queue());
         app.pane_mut(AgentId::Claude).cfg = AgentConfig {
             command: "sh".into(),
             args: vec!["-c".into(), "exit 0".into()],

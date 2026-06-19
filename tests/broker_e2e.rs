@@ -55,9 +55,10 @@ fn call_send_to_peer(port: u16, agent_id: &str, message: &str) -> String {
 fn approved_peer_message_is_injected_into_peer_pty() {
     let dir = tempfile::tempdir().unwrap();
     let tl = Timeline::open(&dir.path().join("timeline.jsonl")).unwrap();
+    let history = parley_tui::history::History::open(&dir.path().join("history.jsonl")).unwrap();
     let cwd = dir.path().to_path_buf();
     let pending = new_queue();
-    let mut app = App::new(Config::default(), tl, cwd, pending.clone());
+    let mut app = App::new(Config::default(), tl, history, cwd, pending.clone());
 
     // Peer (codex) = fake agent echujący wejście, żeby wstrzyknięcie było widoczne na ekranie.
     app.pane_mut(AgentId::Codex).cfg = AgentConfig {

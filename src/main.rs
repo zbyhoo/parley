@@ -6,8 +6,31 @@ use parley_tui::config::Config;
 use parley_tui::router::AgentId;
 use parley_tui::timeline::Timeline;
 use parley_tui::ui;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::supports_keyboard_enhancement;
 use ratatui::layout::Rect;
+
+/// Włącza rozszerzony protokół klawiatury, jeśli terminal go wspiera.
+/// Zwraca true gdy flagi zostały wypchnięte (trzeba je potem zdjąć).
+fn enable_keyboard_enhancement() -> bool {
+    if matches!(supports_keyboard_enhancement(), Ok(true)) {
+        execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok()
+    } else {
+        false
+    }
+}
+
+fn disable_keyboard_enhancement() {
+    let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+}
 
 fn main() -> Result<()> {
     let cwd = std::env::current_dir()?;
@@ -18,6 +41,8 @@ fn main() -> Result<()> {
     let state_dir = config.state_dir.clone().unwrap_or_else(|| cwd.join(".parley"));
     let session = format!("session-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
     let timeline = Timeline::open(&state_dir.join(&session).join("timeline.jsonl"))?;
+    // Historia promptów jest globalna dla projektu (nie per-sesja).
+    let history = parley_tui::history::History::open(&state_dir.join("history.jsonl"))?;
 
     let pending = parley_tui::pending::new_queue();
     // Broker MCP (komunikacja agent→agent). Brak brokera = degradacja do Etapu 1.
@@ -31,7 +56,10 @@ fn main() -> Result<()> {
     let claude_mcp_path = state_dir.join("claude-mcp.json");
 
     let mut terminal = ratatui::init();
-    let mut app = App::new(config, timeline, cwd, pending);
+    // Rozszerzony protokół klawiatury (jeśli terminal wspiera) — pozwala odróżnić
+    // Shift+Enter od Enter. Bez tego Shift+Enter = Enter; fallbackiem jest Ctrl+J.
+    let kbd_enhanced = enable_keyboard_enhancement();
+    let mut app = App::new(config, timeline, history, cwd, pending);
 
     // Wstrzyknięcie konfiguracji MCP do komend agentów PRZED spawnem (spawn czyta args).
     if let Some(h) = &broker {
@@ -46,7 +74,8 @@ fn main() -> Result<()> {
     // terminal.size() zwraca Result<Size> (ratatui 0.30), budujemy Rect z width/height.
     let sz = terminal.size()?;
     let screen = Rect::new(0, 0, sz.width, sz.height);
-    let a = ui::areas(screen);
+    // Pane height nie zależy od input_h — przekazujemy minimalną wartość.
+    let a = ui::areas(screen, 3);
     app.pty_sizes = [ui::pty_size(a.claude), ui::pty_size(a.codex)];
     app.spawn_agent(AgentId::Claude);
     app.spawn_agent(AgentId::Codex);
@@ -67,6 +96,9 @@ fn main() -> Result<()> {
         h.shutdown();
     }
     app.shutdown();
+    if kbd_enhanced {
+        disable_keyboard_enhancement();
+    }
     ratatui::restore();
     if let Some(w) = hygiene_warning {
         eprintln!("{w}");
@@ -91,7 +123,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
             match event::read()? {
                 Event::Key(k) if k.kind != KeyEventKind::Release => app.handle_key(k),
                 Event::Resize(w, h) => {
-                    let a = ui::areas(Rect::new(0, 0, w, h));
+                    let a = ui::areas(Rect::new(0, 0, w, h), 3);
                     app.resize_ptys([ui::pty_size(a.claude), ui::pty_size(a.codex)]);
                 }
                 _ => {}
