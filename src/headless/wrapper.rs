@@ -91,7 +91,9 @@ fn poll_loop(info: &BrokerInfo, id: &str, handle: &ProxyHandle, stop: &AtomicBoo
                 if let Some(msg) = v.get("message").filter(|m| !m.is_null()) {
                     let from = msg.get("from").and_then(|s| s.as_str()).unwrap_or("peer");
                     let text = msg.get("text").and_then(|s| s.as_str()).unwrap_or("");
-                    handle.inject(&format!("[message from {from}]: {text}"));
+                    handle.inject(&format!(
+                        "[incoming message from {from} — to reply, call the send_to_peer tool with to=\"{from}\"]: {text}"
+                    ));
                 }
             }
             Err(_) => std::thread::sleep(Duration::from_millis(500)),
