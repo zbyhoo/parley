@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod discovery;
 pub mod hub;
+pub mod mcp_cfg;
 pub mod peer;
 pub mod proxy;
 pub mod wrapper;
@@ -29,7 +30,10 @@ pub fn dispatch(args: Vec<String>) -> Result<Dispatch> {
             discovery::stop_broker(&state_dir)?;
             Ok(Dispatch::Done)
         }
-        Invocation::Mcp => anyhow::bail!("`parley mcp` not yet implemented"),
+        Invocation::Mcp => {
+            mcp_cfg::run()?;
+            Ok(Dispatch::Done)
+        }
         Invocation::Wrapper { as_id, command } => {
             wrapper::run(as_id, command)?;
             Ok(Dispatch::Done)
