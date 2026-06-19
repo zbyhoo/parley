@@ -38,7 +38,7 @@ fn main() -> Result<()> {
         let _ = parley_tui::config::write_claude_mcp_config(&claude_mcp_path, h.port);
         for id in [AgentId::Claude, AgentId::Codex] {
             let extra = parley_tui::config::mcp_extra_args(id, h.port, &claude_mcp_path);
-            app.pane_mut(id).cfg.args.extend(extra);
+            parley_tui::config::inject_mcp_args(&mut app.pane_mut(id).cfg, extra);
         }
     }
 

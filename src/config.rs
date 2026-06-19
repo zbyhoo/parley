@@ -142,6 +142,19 @@ pub fn mcp_extra_args(agent: AgentId, port: u16, claude_config_path: &Path) -> V
     }
 }
 
+/// Wstrzykuje argi MCP do komendy startowej (`args`) i do `resume_command`.
+/// Resume to osobny wektor — bez tego injekcja przepadałaby po wznowieniu/Ctrl+R
+/// i peer messaging (`send_to_peer`) znikałby z sesji agenta. Argi trafiają po nazwie
+/// binarki, przed subkomendą — codex wymaga `-c` przed `resume`.
+pub fn inject_mcp_args(cfg: &mut AgentConfig, extra: Vec<String>) {
+    cfg.args.extend(extra.iter().cloned());
+    if let Some(resume) = cfg.resume_command.as_mut() {
+        for (i, arg) in extra.into_iter().enumerate() {
+            resume.insert(1 + i, arg);
+        }
+    }
+}
+
 /// Zapisuje plik konfiguracji MCP dla Claude (wskazywany przez `--mcp-config`).
 /// Trzymany w `.parley/` (już w .gitignore), więc nie zaśmieca projektu.
 pub fn write_claude_mcp_config(path: &Path, port: u16) -> std::io::Result<()> {
@@ -188,6 +201,37 @@ mod tests {
         assert!(args.contains(&"/tmp/.parley/claude-mcp.json".to_string()));
         assert!(args.contains(&"--allowedTools".to_string()));
         assert!(args.contains(&"mcp__parley__send_to_peer".to_string()));
+    }
+
+    #[test]
+    fn inject_mcp_args_reaches_resume_command() {
+        // Regresja: resume gubił injekcję MCP → send_to_peer znikał po Ctrl+R/wznowieniu.
+        let mut cfg = default_codex();
+        let extra = mcp_extra_args(AgentId::Codex, 8765, Path::new("/unused"));
+        inject_mcp_args(&mut cfg, extra);
+
+        // Komenda startowa dostaje argi.
+        assert!(cfg.args.iter().any(|a| a.contains("mcp_servers.parley.url")));
+        // Resume też je ma...
+        let resume = cfg.resume_command.expect("codex ma resume_command");
+        assert!(resume.iter().any(|a| a.contains("mcp_servers.parley.url")));
+        // ...i `-c` jest przed subkomendą `resume` (codex tego wymaga).
+        let first_c = resume.iter().position(|a| a == "-c").unwrap();
+        let resume_pos = resume.iter().position(|a| a == "resume").unwrap();
+        assert!(first_c < resume_pos, "argi -c muszą poprzedzać `resume`: {resume:?}");
+        assert_eq!(resume[0], "codex", "nazwa binarki zostaje pierwsza: {resume:?}");
+    }
+
+    #[test]
+    fn inject_mcp_args_skips_resume_when_none() {
+        let mut cfg = AgentConfig {
+            command: "codex".into(),
+            args: vec![],
+            resume_command: None,
+        };
+        inject_mcp_args(&mut cfg, mcp_extra_args(AgentId::Codex, 8765, Path::new("/unused")));
+        assert!(cfg.args.iter().any(|a| a.contains("mcp_servers.parley.url")));
+        assert!(cfg.resume_command.is_none());
     }
 
     #[test]
