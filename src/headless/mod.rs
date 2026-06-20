@@ -34,6 +34,14 @@ pub fn dispatch(args: Vec<String>) -> Result<Dispatch> {
             mcp_cfg::run()?;
             Ok(Dispatch::Done)
         }
+        Invocation::Help => {
+            println!("{}", cli::HELP);
+            Ok(Dispatch::Done)
+        }
+        Invocation::Version => {
+            println!("parley {}", env!("CARGO_PKG_VERSION"));
+            Ok(Dispatch::Done)
+        }
         Invocation::Wrapper { as_id, command } => {
             wrapper::run(as_id, command)?;
             Ok(Dispatch::Done)

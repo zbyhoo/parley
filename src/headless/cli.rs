@@ -10,9 +10,35 @@ pub enum Invocation {
     Stop,
     /// `parley mcp` → zapis/scalanie .mcp.json.
     Mcp,
+    /// `parley -h|--help|help` → tekst pomocy.
+    Help,
+    /// `parley -V|--version` → wersja.
+    Version,
     /// `parley [--as id] <cmd...>` → wrapper.
     Wrapper { as_id: Option<String>, command: Vec<String> },
 }
+
+/// Tekst pomocy (`parley -h`).
+pub const HELP: &str = "\
+parley — split-pane multi-agent TUI & headless peer messaging
+
+USAGE:
+    parley                       Launch the TUI (claude + codex side by side)
+    parley <agent> [args...]     Run an agent CLI connected to its peers (headless)
+    parley --as <id> <agent>...  Connect with an explicit peer id
+    parley stop                  Stop the background broker daemon
+    parley mcp                   Write/merge the parley MCP entry into .mcp.json
+    parley -h, --help            Show this help
+    parley -V, --version         Show version
+
+AGENTS (headless):
+    parley claude                claude code, connected to peers
+    parley codex                 codex CLI, connected to peers
+    parley opencode              opencode CLI, connected to peers
+    Extra args pass through, e.g.  parley codex resume --last
+
+Peers talk via the send_to_peer / list_peers MCP tools, injected automatically.
+Use '--' to stop parley flag parsing, e.g.  parley -- stop --flag  runs an agent named 'stop'.";
 
 pub fn parse(args: &[String]) -> Result<Invocation, String> {
     if args.is_empty() {
@@ -37,6 +63,8 @@ pub fn parse(args: &[String]) -> Result<Invocation, String> {
             "__serve" if i == 0 => return Ok(Invocation::Serve),
             "stop" if i == 0 => return Ok(Invocation::Stop),
             "mcp" if i == 0 => return Ok(Invocation::Mcp),
+            "-h" | "--help" | "help" if i == 0 => return Ok(Invocation::Help),
+            "-V" | "--version" if i == 0 => return Ok(Invocation::Version),
             _ => break, // pierwszy nie-flagowy token = binarka
         }
     }
@@ -67,6 +95,24 @@ mod tests {
         assert_eq!(p(&["__serve"]), Ok(Invocation::Serve));
         assert_eq!(p(&["stop"]), Ok(Invocation::Stop));
         assert_eq!(p(&["mcp"]), Ok(Invocation::Mcp));
+    }
+
+    #[test]
+    fn help_and_version_flags() {
+        assert_eq!(p(&["-h"]), Ok(Invocation::Help));
+        assert_eq!(p(&["--help"]), Ok(Invocation::Help));
+        assert_eq!(p(&["help"]), Ok(Invocation::Help));
+        assert_eq!(p(&["-V"]), Ok(Invocation::Version));
+        assert_eq!(p(&["--version"]), Ok(Invocation::Version));
+    }
+
+    #[test]
+    fn help_flag_after_binary_passes_through() {
+        // `parley claude -h` → pomoc agenta, nie parley
+        assert_eq!(
+            p(&["claude", "-h"]),
+            Ok(Invocation::Wrapper { as_id: None, command: vec!["claude".into(), "-h".into()] })
+        );
     }
 
     #[test]
