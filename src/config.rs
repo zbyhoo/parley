@@ -207,6 +207,20 @@ pub fn write_mcp_config_json(
     std::fs::write(path, json)
 }
 
+/// Treść configu opencode (do zmiennej `OPENCODE_CONFIG_CONTENT`).
+/// Opencode nie ma flagi `--mcp-config`; serwer MCP konfiguruje się plikiem/env.
+/// Wstrzykujemy inline JSON per-proces: remote MCP brokera + nagłówki (id + token),
+/// oraz `permission: {"*":"allow"}` żeby agent nie pytał o zgodę na każde wywołanie narzędzia.
+pub fn opencode_config_content(id: &str, port: u16, token: &str) -> String {
+    format!(
+        "{{\"$schema\":\"https://opencode.ai/config.json\",\
+         \"mcp\":{{\"parley\":{{\"type\":\"remote\",\
+         \"url\":\"http://127.0.0.1:{port}/mcp\",\"enabled\":true,\
+         \"headers\":{{\"X-Agent-Id\":\"{id}\",\"X-Parley-Token\":\"{token}\"}}}}}},\
+         \"permission\":{{\"*\":\"allow\"}}}}"
+    )
+}
+
 /// Dispatch po nazwie binarki: `codex*` → inline `-c`, reszta → flagi claude.
 pub fn mcp_args_for(
     binary: &str,
@@ -403,6 +417,19 @@ resume_command = ["codex", "resume", "--last"]
         assert!(c.contains("http://127.0.0.1:8765/mcp"));
         assert!(c.contains("\"X-Agent-Id\": \"reviewer\""));
         assert!(c.contains("\"X-Parley-Token\": \"tok123\""));
+    }
+
+    #[test]
+    fn opencode_config_has_url_headers_and_permission() {
+        let c = opencode_config_content("opencode-2", 8765, "tok123");
+        assert!(c.contains("\"type\":\"remote\""));
+        assert!(c.contains("http://127.0.0.1:8765/mcp"));
+        assert!(c.contains("\"X-Agent-Id\":\"opencode-2\""));
+        assert!(c.contains("\"X-Parley-Token\":\"tok123\""));
+        assert!(c.contains("\"permission\":{\"*\":\"allow\"}"));
+        // Musi być poprawnym JSON-em (trafia do OPENCODE_CONFIG_CONTENT).
+        let v: serde_json::Value = serde_json::from_str(&c).expect("valid JSON");
+        assert_eq!(v["mcp"]["parley"]["url"], "http://127.0.0.1:8765/mcp");
     }
 
     #[test]

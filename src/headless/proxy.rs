@@ -66,7 +66,11 @@ impl ProxyChild {
 pub struct Proxy;
 
 impl Proxy {
-    pub fn spawn(command: &[String], cwd: &Path) -> Result<(ProxyHandle, ProxyChild)> {
+    pub fn spawn(
+        command: &[String],
+        cwd: &Path,
+        env: &[(String, String)],
+    ) -> Result<(ProxyHandle, ProxyChild)> {
         let (rows, cols) = term_size();
         let (program, args) = command.split_first().context("empty command")?;
         let pty = native_pty_system();
@@ -76,6 +80,11 @@ impl Proxy {
         let mut cmd = CommandBuilder::new(program);
         cmd.args(args);
         cmd.cwd(cwd);
+        // Per-proces zmienne środowiskowe (dziedziczy resztę env rodzica).
+        // Używane m.in. przez opencode: config MCP idzie przez OPENCODE_CONFIG_CONTENT, nie flagą.
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         let child = pair.slave.spawn_command(cmd).map_err(|e| anyhow::anyhow!("spawn: {e}"))?;
         drop(pair.slave);
 

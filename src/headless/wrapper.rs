@@ -19,18 +19,29 @@ pub fn run(as_id: Option<String>, command: Vec<String>) -> Result<()> {
     let id = register(&info, &binary, as_id.as_deref())?;
     eprintln!("[parley] connected as '{id}' (broker port {})", info.port);
 
-    // MCP args injection
-    let cfg_path = state_dir.join(format!("mcp-{id}.json"));
+    // MCP injection — trzy style wg binarki:
+    //   codex*    → inline flagi `-c`
+    //   opencode* → env OPENCODE_CONFIG_CONTENT (opencode nie ma flagi --mcp-config)
+    //   reszta (claude) → plik JSON + flaga --mcp-config
     let base = Path::new(&binary).file_name().and_then(|s| s.to_str()).unwrap_or(&binary);
-    if !base.starts_with("codex") {
-        crate::config::write_mcp_config_json(&cfg_path, &id, info.port, &info.token)
-            .map_err(|e| anyhow::anyhow!("write_mcp_config_json: {e}"))?;
-    }
     let mut full = command.clone();
-    let extra = crate::config::mcp_args_for(&binary, &id, info.port, &info.token, &cfg_path);
-    full.extend(extra);
+    let mut env: Vec<(String, String)> = Vec::new();
+    if base.starts_with("opencode") {
+        env.push((
+            "OPENCODE_CONFIG_CONTENT".into(),
+            crate::config::opencode_config_content(&id, info.port, &info.token),
+        ));
+    } else {
+        let cfg_path = state_dir.join(format!("mcp-{id}.json"));
+        if !base.starts_with("codex") {
+            crate::config::write_mcp_config_json(&cfg_path, &id, info.port, &info.token)
+                .map_err(|e| anyhow::anyhow!("write_mcp_config_json: {e}"))?;
+        }
+        let extra = crate::config::mcp_args_for(&binary, &id, info.port, &info.token, &cfg_path);
+        full.extend(extra);
+    }
 
-    let (handle, proxy_child) = Proxy::spawn(&full, &cwd)?;
+    let (handle, proxy_child) = Proxy::spawn(&full, &cwd, &env)?;
 
     // Long-poll thread gets a clone of the handle (no shared ownership of child).
     let stop = Arc::new(AtomicBool::new(false));
