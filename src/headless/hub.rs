@@ -135,17 +135,27 @@ impl HubBroker {
         Ok(CallToolResult::success(vec![Content::text(reply)]))
     }
 
-    #[tool(description = "List currently connected peers (id and binary).")]
+    #[tool(
+        description = "List currently connected peers (id and binary). Your own entry is marked \
+                       \"(you)\" so you know which id is yours."
+    )]
     async fn list_peers(
         &self,
         Parameters(NoArgs {}): Parameters<NoArgs>,
-        _ctx: RequestContext<RoleServer>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let me = header(&ctx, "x-agent-id");
         let list = self.state.reg.lock().unwrap().list();
         let text = if list.is_empty() {
             "no peers connected".to_string()
         } else {
-            list.iter().map(|(id, bin)| format!("{id} ({bin})")).collect::<Vec<_>>().join("\n")
+            list.iter()
+                .map(|(id, bin)| {
+                    let you = if me.as_deref() == Some(id.as_str()) { " (you)" } else { "" };
+                    format!("{id} ({bin}){you}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         };
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
