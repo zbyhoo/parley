@@ -2,11 +2,27 @@
 //! może wstrzyknąć tekst do stdin agenta (wiadomości od peerów).
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+
+/// Write end of the self-pipe. The SIGWINCH handler writes one byte (async-signal-safe),
+/// waking the resize thread blocked on the read end. -1 until the pipe is set up.
+static WINCH_PIPE_W: AtomicI32 = AtomicI32::new(-1);
+
+#[cfg(unix)]
+extern "C" fn handle_winch(_sig: libc::c_int) {
+    let fd = WINCH_PIPE_W.load(Ordering::SeqCst);
+    if fd >= 0 {
+        let b = 1u8;
+        unsafe {
+            libc::write(fd, &b as *const u8 as *const libc::c_void, 1);
+        }
+    }
+}
 
 /// Clone-able handle used by the poll thread to inject messages into the agent stdin.
 #[derive(Clone)]
@@ -88,16 +104,22 @@ impl Proxy {
         let child = pair.slave.spawn_command(cmd).map_err(|e| anyhow::anyhow!("spawn: {e}"))?;
         drop(pair.slave);
 
-        // Block SIGWINCH on the main thread before spawning threads so all
-        // child threads inherit the mask. The dedicated SIGWINCH thread will
-        // sigwait() for it and call resize on delivery.
+        // Self-pipe + SIGWINCH handler: the handler writes one byte to the pipe
+        // (async-signal-safe), waking the resize thread immediately — no poll latency.
+        // (sigwait() does not reliably deliver SIGWINCH here on macOS, hence a handler.)
         #[cfg(unix)]
-        unsafe {
-            let mut set: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut set);
-            libc::sigaddset(&mut set, libc::SIGWINCH);
-            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-        }
+        let winch_read_fd: libc::c_int = unsafe {
+            let mut fds = [0 as libc::c_int; 2];
+            if libc::pipe(fds.as_mut_ptr()) == 0 {
+                WINCH_PIPE_W.store(fds[1], Ordering::SeqCst);
+                let mut sa: libc::sigaction = std::mem::zeroed();
+                sa.sa_sigaction = handle_winch as *const () as usize;
+                libc::sigemptyset(&mut sa.sa_mask);
+                sa.sa_flags = libc::SA_RESTART;
+                libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut());
+            }
+            fds[0]
+        };
 
         // Wrap master in Arc<Mutex<...>> so the SIGWINCH thread can resize it.
         let master_arc: Arc<Mutex<Box<dyn MasterPty + Send>>> =
@@ -154,32 +176,35 @@ impl Proxy {
             });
         }
 
-        // SIGWINCH thread: sigwait for SIGWINCH and resize PTY to match new terminal size.
-        // Runs forever; torn down on process exit. resize_to_current() remains callable manually.
+        // SIGWINCH thread: blocks on the self-pipe read end; wakes the instant the
+        // handler writes, then resizes the PTY to the new terminal size. Runs forever;
+        // torn down on process exit.
+        #[cfg(unix)]
         {
             let master_arc = Arc::clone(&master_arc);
             std::thread::spawn(move || {
-                #[cfg(unix)]
-                unsafe {
-                    let mut set: libc::sigset_t = std::mem::zeroed();
-                    libc::sigemptyset(&mut set);
-                    libc::sigaddset(&mut set, libc::SIGWINCH);
-                    // Re-block in this thread's mask (inherited, but explicit for clarity).
-                    libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-                    let mut sig: libc::c_int = 0;
-                    loop {
-                        if libc::sigwait(&set, &mut sig) != 0 {
-                            break;
-                        }
-                        let (rows, cols) = term_size();
-                        if let Ok(m) = master_arc.lock() {
-                            let _ = m.resize(PtySize {
-                                rows,
-                                cols,
-                                pixel_width: 0,
-                                pixel_height: 0,
-                            });
-                        }
+                let mut buf = [0u8; 64];
+                loop {
+                    // SA_RESTART means read() resumes across signals; a non-positive
+                    // return is EOF/error, so we stop.
+                    let n = unsafe {
+                        libc::read(
+                            winch_read_fd,
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            buf.len(),
+                        )
+                    };
+                    if n <= 0 {
+                        break;
+                    }
+                    let (rows, cols) = term_size();
+                    if let Ok(m) = master_arc.lock() {
+                        let _ = m.resize(PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
                     }
                 }
             });
